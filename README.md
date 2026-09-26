@@ -2,11 +2,11 @@
 
 > Z21/XpressNet gateway and emulator built around an ATmega2560 + ESP8266, designed to bridge a Roco MultiMaus with the Z21 LAN protocol.
 
-[Status](https://img.shields.io/badge/status-ACTIVE-2ea44f)
-[Platform](https://img.shields.io/badge/platform-Arduino-00979D)
-[MCU](https://img.shields.io/badge/MCU-ATmega2560-blue)
-[WiFi](https://img.shields.io/badge/WiFi-ESP8266-orange)
-[Protocol](https://img.shields.io/badge/protocol-Z21%20%7C%20XpressNet-purple)
+![Status](https://img.shields.io/badge/status-ACTIVE-2ea44f)
+![Platform](https://img.shields.io/badge/platform-Arduino-00979D)
+![MCU](https://img.shields.io/badge/MCU-ATmega2560-blue)
+![WiFi](https://img.shields.io/badge/WiFi-ESP8266-orange)
+![Protocol](https://img.shields.io/badge/protocol-Z21%20%7C%20XpressNet-purple)
 
 ---
 
