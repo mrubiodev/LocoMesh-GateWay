@@ -328,7 +328,15 @@ uint8_t respBuf[LINK_BUF_SIZE];
 void sendDatasetToClient(uint8_t targetClientId, uint16_t header, const uint8_t *data, uint8_t dataLen) {
   if (targetClientId == CLIENT_ID_NONE) return;
   uint16_t total = 4 + dataLen; // DataLen Z21 incluye los 4 bytes de cabecera (header+len), no el client-id
-  if (total > LINK_BUF_SIZE - 1) return; // no debería pasar con los datasets que maneja este firmware; guarda de seguridad
+  // Guarda de seguridad: el framing interno manda "total+1" (client-id +
+  // dataset) en el byte LEN del frame, que es un uint8_t (max 255). Con
+  // total==255 (dataLen==251), total+1==256 se trunca a 0 y el frame sale
+  // con LEN=0 -- un paquete vacío enviado en silencio, sin error visible
+  // (mismo tipo de overflow que el bug de maxLen documentado más arriba en
+  // tryReadFrameFromESP()). Por eso el límite real es total<=254, no
+  // LINK_BUF_SIZE-1==255. No debería dispararse con los datasets que manda
+  // hoy este firmware (máx. 6 bytes), pero sí en cuanto alguno crezca.
+  if (total > LINK_BUF_SIZE - 2) return;
   respBuf[0] = targetClientId;
   respBuf[1] = total & 0xFF;
   respBuf[2] = (total >> 8) & 0xFF;
@@ -442,6 +450,7 @@ void handleNetInfo(const uint8_t *payload, uint8_t len) {
   }
 
   synced = true;
+  syncDegraded = false; // llegó NET_INFO real: ya no estamos en modo degradado, aunque hubiéramos hecho timeout antes
   sendSyncAck();
 
   DEBUG_SERIAL.print(F("[SYNC] NET_INFO recibido: modo="));
@@ -740,7 +749,7 @@ void handleXGetVersion() {
   uint8_t x[5];
   x[0] = 0x63; // XHeader respuesta
   x[1] = 0x21; // DB0
-  x[2] = 0x36; // DB1: XBUS_VER 3.6 (CRÍTICO: en lugar de 0x30)
+  x[2] = 0x30; // DB1: XBUS_VER 3.0 (valor correcto según el PDF, ver comentario arriba)
   x[3] = 0x12; // DB2: CMDST_ID (Familia Z21)
   x[4] = xorChecksum(x, 4);
   sendXDataset(x, 5);

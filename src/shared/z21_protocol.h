@@ -210,8 +210,12 @@
 // el UDP Z21 y empieza a reenviar tráfico real. Si no se completa en
 // SYNC_TIMEOUT_MS, el Mega sigue igualmente en "modo degradado" (sin info
 // de red, pero funcional) para no bloquearse para siempre si algo falla.
+// SYNC_TIMEOUT_MS cubre el peor caso real del ESP: hasta WIFI_MAX_NETWORKS (3)
+// redes guardadas, cada una con STA_CONNECT_TIMEOUT_MS (10000 ms) de intento
+// bloqueante en connectWiFi() antes de que el ESP pueda leer el Serial y
+// contestar el HELLO. 3*10000 = 30000 ms peor caso + margen.
 #define SYNC_HELLO_INTERVAL_MS 300
-#define SYNC_TIMEOUT_MS 8000
+#define SYNC_TIMEOUT_MS 35000
 
 // NetInfo payload (todo lo manda el ESP en FRAME_TYPE_NET_INFO), desde v0.9:
 //   modo(1) | ip(4, orden de bytes normal, ip[0]=primer octeto) |

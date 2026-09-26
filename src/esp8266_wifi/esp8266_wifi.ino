@@ -321,6 +321,21 @@ bool isAPMode = false;
 String apSSID = ""; // se rellena en startAPFallback(); usado también en NET_INFO
 unsigned long apModeSinceMs = 0; // 0 = no estamos en AP; si no, marca de tiempo de cuando se entro en AP (para el reintento periodico, ver maybeRetrySTA())
 
+// Cuantos reintentos automaticos en background (maybeRetrySTA) se han
+// hecho ya sin exito desde el ultimo arranque. Motivo: si el router
+// esta rechazando la conexion por algo que NO se va a arreglar solo
+// (password mal guardada, cifrado no soportado...), reintentar cada
+// WIFI_STA_RETRY_INTERVAL_MS para siempre no sirve de nada -- solo tira
+// el AP (cortando a los clientes ya conectados a el) sin cambiar el
+// resultado. Tras WIFI_STA_MAX_RETRIES intentos en vano, se deja de
+// reintentar solo; el usuario puede forzar un reintento manual desde el
+// portal (ver /wifi_retry) si cree que la causa ya no aplica (cambio
+// algo en el router, etc.), o simplemente reiniciando el ESP (esta
+// cuenta vive solo en RAM, se resetea con cada arranque -- y handleSave()
+// ya reinicia tras guardar una config nueva).
+#define WIFI_STA_MAX_RETRIES 3
+uint8_t staRetryCount = 0;
+
 WiFiUDP z21Udp;
 ESP8266WebServer webServer(80);
 
@@ -702,16 +717,19 @@ String macToString(const uint8_t *mac) {
   return String(buf);
 }
 
-// Aplica la MAC a las interfaces STA y AP del ESP8266. Hay que llamarla
-// DESPUES de WiFi.mode(...) y ANTES de WiFi.begin()/softAP() --
-// wifi_set_macaddr() necesita el modo ya puesto, y para que la
-// conexion/AP arranque ya con la MAC nueva desde el primer paquete
-// (algunos routers registran la MAC del primer frame DHCP/ARP).
+// Aplica la MAC a las interfaces STA y AP del ESP8266 y DESPUES activa
+// el modo WiFi indicado (targetMode). Importante: wifi_set_macaddr()
+// del SDK del ESP8266 solo funciona de forma fiable con la interfaz
+// APAGADA -- llamarla con el modo ya encendido (como se hacia antes)
+// provocaba fallos intermitentes ("STA FALLO"/"AP FALLO" en el log) Y
+// ademas dejaba el WiFi.begin()/softAP() posterior en un estado roto
+// (el radio ni siquiera llegaba a intentar asociarse). Por eso el orden
+// correcto es: apagar WiFi -> fijar MAC -> encender el modo que toque.
 //
 // Si hay una MAC personalizada guardada, se usa esa. Si no, se usa la
 // MAC por defecto de nuestra red (prefijo 84:2B:BC + bytes del chip ID),
 // en vez de dejar la MAC de fabrica del chip.
-void applyMac() {
+void applyMac(WiFiMode_t targetMode) {
   uint8_t effectiveMac[6];
   const char *origen;
   if (cfgMacCustomEnabled) {
@@ -721,10 +739,24 @@ void applyMac() {
     generateDefaultMac(effectiveMac);
     origen = "por defecto (84:2B:BC)";
   }
+
+  // Apagamos WiFi antes de tocar la MAC -- con la interfaz ya activa
+  // wifi_set_macaddr() falla o deja el radio en un estado inconsistente.
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+
   bool okSta = wifi_set_macaddr(STATION_IF, effectiveMac);
+  if (!okSta) { delay(50); okSta = wifi_set_macaddr(STATION_IF, effectiveMac); }
   bool okAp = wifi_set_macaddr(SOFTAP_IF, effectiveMac);
+  if (!okAp) { delay(50); okAp = wifi_set_macaddr(SOFTAP_IF, effectiveMac); }
+
   evLogfL(LOG_LVL_WARN, "[MAC] Aplicando MAC %s: %s (STA %s, AP %s)",
           origen, macToString(effectiveMac).c_str(), okSta ? "OK" : "FALLO", okAp ? "OK" : "FALLO");
+
+  // Ahora si, encendemos el modo que va a usar el que llama (STA o AP).
+  // El propio WiFi.mode() ya tarda lo suyo en el SDK; no hace falta
+  // delay extra aqui.
+  WiFi.mode(targetMode);
 }
 
 // ---------------------------------------------------------------------
@@ -734,8 +766,7 @@ void startAPFallback() {
   isAPMode = true;
   apModeSinceMs = millis(); // arranca (o reinicia) el contador para el reintento periodico
   apSSID = String(AP_SSID_PREFIX) + String(ESP.getChipId(), HEX);
-  WiFi.mode(WIFI_AP);
-  applyMac();
+  applyMac(WIFI_AP);
   WiFi.softAPConfig(AP_FIXED_IP, AP_GATEWAY, AP_SUBNET);
   // max_connection=8: este SI es un limite real (no arbitrario nuestro) --
   // es el maximo de estaciones WiFi que el chip ESP8266 puede tener
@@ -749,6 +780,27 @@ void startAPFallback() {
   evLogf("[WiFi] Modo AP SSID=%s IP=%d.%d.%d.%d MAC=%s", apSSID.c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.softAPmacAddress().c_str());
 }
 
+// Traduce WiFi.status() a texto legible para el log. Sirve sobre todo
+// para diferenciar, cuando una red guardada falla, si el problema es que
+// el ESP8266 ni siquiera VE el SSID (red oculta, 2.4GHz apagado en el
+// router, o el nombre solo existe en la banda 5GHz -- el ESP8266 no tiene
+// radio 5GHz, es una limitacion de hardware, no de este firmware) frente
+// a que SI lo ve pero falla la autenticacion (password incorrecta, o
+// cifrado no soportado: el ESP8266 no soporta WPA3 ni bien el modo mixto
+// WPA2/WPA3 con PMF obligatorio que traen por defecto muchos routers
+// recientes).
+const char *wifiStatusToString(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL: return "SSID no visible en 2.4GHz";
+    case WL_CONNECT_FAILED: return "fallo autenticacion";
+    case WL_WRONG_PASSWORD: return "password incorrecta";
+    case WL_CONNECTION_LOST: return "conexion perdida";
+    case WL_DISCONNECTED: return "desconectado sin completar";
+    case WL_IDLE_STATUS: return "sigue en idle";
+    default: return "estado desconocido";
+  }
+}
+
 // Intenta conectar, en orden, a cada una de las hasta WIFI_MAX_NETWORKS
 // redes guardadas en EEPROM. Se detiene en la primera que conecte. Si
 // ninguna conecta (o no hay ninguna guardada), cae a modo AP.
@@ -757,6 +809,45 @@ void startAPFallback() {
 // reintentar en segundo plano mientras estamos en modo AP -- por eso pone
 // WiFi.mode(WIFI_STA) explicitamente cada vez, para salir limpiamente del
 // modo AP si veniamos de ahi.
+// Traduce el codigo de razon de desconexion 802.11 (WiFiEventStationModeDisconnected::reason)
+// a texto legible. Este dato es MUCHO mas preciso que wl_status_t: mientras
+// WL_DISCONNECTED solo dice "no se completo la conexion", este reason code
+// dice EN QUE PASO exacto fallo -- p.ej. "el handshake WPA2 nunca se
+// completo" apunta directamente a password incorrecta o al problema de
+// ancho de canal 40MHz que se comenta mas abajo, en vez de "sin
+// alcance/señal" que induce a pensar en un problema de distancia que, si
+// estas al lado del router, casi seguro no es la causa real.
+const char *wifiDisconnectReasonToString(uint8_t reason) {
+  switch (reason) {
+    case REASON_AUTH_EXPIRE: return "auth expirada";
+    case REASON_AUTH_LEAVE: return "router cerro la auth";
+    case REASON_ASSOC_EXPIRE: return "asociacion expirada";
+    case REASON_ASSOC_TOOMANY: return "router lleno de clientes";
+    case REASON_NOT_AUTHED: return "no autenticado";
+    case REASON_NOT_ASSOCED: return "no asociado";
+    case REASON_MIC_FAILURE: return "fallo MIC (password mal)";
+    case REASON_4WAY_HANDSHAKE_TIMEOUT: return "handshake WPA2 sin completar (pass mal o router en 40MHz)";
+    case REASON_GROUP_KEY_UPDATE_TIMEOUT: return "timeout clave de grupo";
+    case REASON_IE_IN_4WAY_DIFFERS: return "info inconsistente en handshake";
+    case REASON_GROUP_CIPHER_INVALID: return "cifrado grupo no soportado";
+    case REASON_PAIRWISE_CIPHER_INVALID: return "cifrado no soportado";
+    case REASON_AKMP_INVALID: return "auth no soportada (WPA3?)";
+    case REASON_CIPHER_SUITE_REJECTED: return "cifrado no soportado por ESP";
+    case REASON_BEACON_TIMEOUT: return "beacons perdidos (interfer./40MHz)";
+    case REASON_NO_AP_FOUND: return "SSID no encontrado al asociarse";
+    case REASON_AUTH_FAIL: return "auth rechazada por el router";
+    case REASON_ASSOC_FAIL: return "asociacion rechazada";
+    case REASON_HANDSHAKE_TIMEOUT: return "timeout handshake";
+    default: return "razon no reconocida";
+  }
+}
+
+// Se actualiza desde el callback de WiFi.onStationModeDisconnected(),
+// registrado en setup(). connectWiFi() lo resetea a 0 antes de cada
+// WiFi.begin() para no arrastrar el motivo de un intento anterior.
+uint8_t lastDisconnectReason = 0;
+WiFiEventHandler staDisconnectHandler;
+
 void connectWiFi() {
   bool anySsidConfigured = false;
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
@@ -775,8 +866,7 @@ void connectWiFi() {
     if (strlen(cfgSSID[i]) > 0) networksConfigured++;
   }
 
-  WiFi.mode(WIFI_STA);
-  applyMac();
+  applyMac(WIFI_STA);
 
   uint8_t attemptIndex = 0;
   for (uint8_t i = 0; i < WIFI_MAX_NETWORKS; i++) {
@@ -790,6 +880,7 @@ void connectWiFi() {
     // el historial de z21_protocol.h, "WifiAttempt"). La password NUNCA
     // se manda al Mega -- solo vive aquí y en el portal web.
     sendWifiAttempt(WIFI_ATTEMPT_TRYING, attemptIndex, networksConfigured, cfgSSID[i]);
+    lastDisconnectReason = 0; // se resetea para no arrastrar el motivo de un intento anterior
     WiFi.begin(cfgSSID[i], cfgPass[i]);
 
     unsigned long start = millis();
@@ -801,13 +892,19 @@ void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
       isAPMode = false;
       apModeSinceMs = 0; // ya no estamos en AP, se desactiva el reintento periodico
+      staRetryCount = 0; // exito -- se resetea la cuenta de reintentos en vano
       IPAddress ip = WiFi.localIP();
       evLogf("[WiFi] Conectado a %s. IP=%d.%d.%d.%d RSSI=%d MAC=%s", cfgSSID[i], ip[0], ip[1], ip[2], ip[3], WiFi.RSSI(), WiFi.macAddress().c_str());
       sendWifiAttempt(WIFI_ATTEMPT_CONNECTED, attemptIndex, networksConfigured, cfgSSID[i]);
       return;
     }
 
-    evLogfL(LOG_LVL_WARN, "[WiFi] Timeout conectando a %s", cfgSSID[i]);
+    evLogfL(LOG_LVL_WARN, "[WiFi] Fallo %s: %s", cfgSSID[i], wifiStatusToString(WiFi.status()));
+    if (lastDisconnectReason != 0) {
+      evLogfL(LOG_LVL_WARN, "[WiFi] Razon 802.11: %s", wifiDisconnectReasonToString(lastDisconnectReason));
+    } else {
+      evLogfL(LOG_LVL_WARN, "[WiFi] Sin evento de desconexion -- ni lleg\xC3\xB3 a intentar asociarse");
+    }
     sendWifiAttempt(WIFI_ATTEMPT_FAILED, attemptIndex, networksConfigured, cfgSSID[i]);
     WiFi.disconnect(); // limpio antes de probar la siguiente red
   }
@@ -815,6 +912,11 @@ void connectWiFi() {
   evLogfL(LOG_LVL_WARN, "[WiFi] Ninguna de las redes guardadas disponible -> fallback a AP");
   sendWifiAttempt(WIFI_ATTEMPT_AP_FALLBACK, 0, networksConfigured, "");
   startAPFallback();
+
+  staRetryCount++;
+  if (staRetryCount >= WIFI_STA_MAX_RETRIES) {
+    evLogfL(LOG_LVL_WARN, "[WiFi] %d intentos en vano -- se dejan de reintentar solos las redes guardadas. Reintento manual desde el portal (bot\xC3\xB3n en la p\xC3\xA1gina principal) o reiniciando el ESP.", staRetryCount);
+  }
 }
 
 // Se llama en cada vuelta de loop(). Mientras estemos en modo AP, cada
@@ -825,6 +927,16 @@ void connectWiFi() {
 // decidir CUANDO reintentar.
 void maybeRetrySTA() {
   if (!isAPMode || apModeSinceMs == 0) return;
+
+  if (staRetryCount >= WIFI_STA_MAX_RETRIES) {
+    // Ya se agotaron los reintentos automaticos -- no se vuelve a tocar
+    // el AP hasta que el usuario fuerce un reintento manual (/wifi_retry)
+    // o se reinicie el ESP. No hace falta loguear esto en cada vuelta de
+    // loop(): con que quedara constancia una vez, cuando se agoto el
+    // ultimo intento (ver mas abajo en connectWiFi()), es suficiente.
+    return;
+  }
+
   if (millis() - apModeSinceMs < WIFI_STA_RETRY_INTERVAL_MS) return;
 
   evLogf("[WiFi] En modo AP, reintentando conectar a alguna red guardada...");
@@ -1542,6 +1654,22 @@ String jsonEscape(const String &in) {
 // Escanea las redes WiFi visibles y las devuelve en JSON, para que el
 // formulario de configuracion las ofrezca en una lista en vez de tener
 // que escribir el SSID a mano (ver scanNetworks() en app.js / web_assets.h).
+// Fuerza un reintento de conexion STA fuera del ciclo automatico de
+// maybeRetrySTA() -- pensado para cuando WIFI_STA_MAX_RETRIES ya se agoto
+// (ver connectWiFi()) y el usuario quiere reintentar manualmente sin
+// esperar a un reinicio (p.ej. tras corregir algo en el router). Resetea
+// la cuenta de reintentos para darle otra tanda completa de intentos.
+void handleWifiRetry() {
+  if (!checkWebAuth()) return;
+
+  evLogf("[WiFi] Reintento manual solicitado desde el portal");
+  staRetryCount = 0;
+  connectWiFi();
+
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
 void handleScan() {
   if (!checkWebAuth()) return;
 
@@ -1779,6 +1907,15 @@ void handleRoot() {
   html += cfgMacCustomEnabled ? " (personalizada)" : " (por defecto, prefijo 84:2B:BC)";
   html += "</p>";
   html += "<p>OTA (actualizacion por WiFi): activo, hostname '" + htmlEscape(otaHostname) + "' (deberia aparecer como puerto de red en el IDE de Arduino; password propia, ver Configuraci&oacute;n)</p>";
+  if (isAPMode) {
+    if (staRetryCount >= WIFI_STA_MAX_RETRIES) {
+      html += "<p><strong>Reintentos automaticos agotados (" + String(staRetryCount) + "/" + String(WIFI_STA_MAX_RETRIES) + ").</strong> ";
+      html += "Ya no se vuelve a tocar el AP solo -- revisa el <a href='/log'>log</a> para ver por que fallaron, corrige lo que haga falta y pulsa aqui:</p>";
+    } else {
+      html += "<p>Reintentando conectar a las redes guardadas cada " + String(WIFI_STA_RETRY_INTERVAL_MS / 1000) + "s (intento " + String(staRetryCount) + "/" + String(WIFI_STA_MAX_RETRIES) + "). Tambien puedes forzarlo ahora:</p>";
+    }
+    html += "<p><a href='/wifi_retry'><button type='button'>Reintentar conexi&oacute;n ahora</button></a></p>";
+  }
   html += "</div>";
 
   html += "<div class='card'>";
@@ -2317,6 +2454,7 @@ void setupWebServer() {
   webServer.on("/style.css", handleStyleCss);
   webServer.on("/app.js", handleAppJs);
   webServer.on("/scan", handleScan);
+  webServer.on("/wifi_retry", handleWifiRetry);
   webServer.on("/backup", handleBackup);
   webServer.on("/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
   // TODO: endpoint websocket para el volcado de tramas (fase 2, mas
@@ -2349,6 +2487,9 @@ void setup() {
   // primer HELLO (ver z21_protocol.h y AGENT.md, "Sincronización inicial").
 
   loadConfig();
+  staDisconnectHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &evt) {
+    lastDisconnectReason = evt.reason;
+  });
   connectWiFi();
 
   z21Udp.begin(Z21_UDP_PORT);
