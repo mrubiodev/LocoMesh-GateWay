@@ -1,5 +1,7 @@
 # LocoMesh Gateway
 
+![LocoMesh Gateway](docs/images/portada.svg)
+
 > Z21/XpressNet gateway and emulator built around an ATmega2560 + ESP8266, designed to bridge a Roco MultiMaus with the Z21 LAN protocol.
 
 ![Status](https://img.shields.io/badge/status-ACTIVE-2ea44f)
